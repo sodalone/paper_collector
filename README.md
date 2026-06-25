@@ -87,7 +87,3 @@ python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py collect-
 - 具身报告正文以 `Embodied Task` 索引为唯一正文入口。
 - 自动驾驶报告正文以 `Driving Stack` 索引为唯一正文入口。
 - 可再生成的抓取结果、raw cache 和分类 cache 不进版本库。
-
-## 作者
-
-- [sodalone](https://github.com/sodalone) <soda791401863@gmail.com>

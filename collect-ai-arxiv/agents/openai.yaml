@@ -1,0 +1,6 @@
+interface:
+  display_name: "Collect AI arXiv"
+  short_description: "生成具身智能与自动驾驶 arXiv 日报周报"
+  default_prompt: "Use $collect-ai-arxiv to generate a Chinese embodied-intelligence or autonomous-driving arXiv daily or weekly report."
+policy:
+  allow_implicit_invocation: true

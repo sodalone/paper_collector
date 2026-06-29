@@ -30,6 +30,9 @@ DEFAULT_DAILY_MAX_RESULTS = 100
 DEFAULT_WEEKLY_MAX_RESULTS = 1000
 DEFAULT_LLM_BATCH_SIZE = 60
 DEFAULT_CLASSIFIER_TIMEOUT = 600
+DEFAULT_TRAE_MODEL = "GPT-5.5"
+DEFAULT_TRAE_THINKING_EFFORT = "high"
+DEFAULT_TRAE_VERBOSITY = "high"
 EMBODIED_PROFILE = "embodied"
 AUTONOMOUS_DRIVING_PROFILE = "autonomous-driving"
 DEFAULT_PROFILE = EMBODIED_PROFILE
@@ -1396,6 +1399,11 @@ def write_llm_cache(cache_path: Path, entries: Dict[str, Dict], profile: str = D
     cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def classification_cache_path(out_dir: Path, classifier: str) -> Path:
+    name = "traecli-classifications.json" if classifier == "traecli" else "codex-classifications.json"
+    return out_dir / ".cache" / name
+
+
 def normalize_list(values: object, allowed: Sequence[str]) -> List[str]:
     if not isinstance(values, list):
         return []
@@ -1615,14 +1623,16 @@ def build_codex_prompt(batch: Sequence[Dict], profile: str = DEFAULT_PROFILE) ->
                 "Planning/Control 覆盖规划、规控、MPC、trajectory optimization、control policy、安全约束控制。",
                 "Data/Simulation 覆盖 dataset、benchmark、simulator、scenario generation、closed-loop benchmark、安全评测。",
                 "纯交通工程、普通 CV、普通机器人且没有自动驾驶栈语境时输出 relevance=none。",
-                "problem_statement 用中文概括论文解决的具体问题。",
-                "method_summary 用中文概括论文提出的具体方法或系统做法。",
+                "problem_statement、method_summary、classification_reason 必须使用中文且每个字段必须包含中文汉字，不要直接复制英文摘要。",
+                "problem_statement 用中文概括论文解决的具体问题；如果摘要为英文，需要理解后改写为中文。",
+                "method_summary 用中文概括论文提出的具体方法或系统做法；如果摘要为英文，需要理解后改写为中文。",
             ],
         }
         return "\n".join(
             [
                 "你是自动驾驶 arXiv 日报/周报分类器。只返回符合 JSON Schema 的 JSON。",
                 "根据论文标题和摘要裁决唯一 Driving Stack 分类，不要让一篇论文进入多个目录。",
+                "所有自然语言字段必须使用中文且包含中文汉字，禁止输出英文整句，不要直接复制英文摘要，不要输出 Markdown 代码块。",
                 "",
                 "Taxonomy:",
                 json.dumps(taxonomy, ensure_ascii=False, indent=2),
@@ -1641,15 +1651,17 @@ def build_codex_prompt(batch: Sequence[Dict], profile: str = DEFAULT_PROFILE) ->
             "如果论文属于具身智能但没有明确具体任务，embodied_tasks 必须包含 General/Cross-task。",
             "Technique Tags 是横向技术标签。",
             "不属于具身智能候选时输出 relevance=none，并说明原因。",
+            "one_line_contribution、problem_statement、method_summary、classification_reason 必须使用中文且每个字段必须包含中文汉字，不要直接复制英文摘要。",
             "one_line_contribution 必须用中文，说明论文为什么值得进入报告。",
-            "problem_statement 用中文概括论文解决的具体问题。",
-            "method_summary 用中文概括论文提出的具体方法或系统做法。",
+            "problem_statement 用中文概括论文解决的具体问题；如果摘要为英文，需要理解后改写为中文。",
+            "method_summary 用中文概括论文提出的具体方法或系统做法；如果摘要为英文，需要理解后改写为中文。",
         ],
     }
     return "\n".join(
         [
             "你是具身智能论文日报/周报分类器。只返回符合 JSON Schema 的 JSON。",
             "根据论文标题和摘要裁决多轴分类，不要按关键词顺序抢主类。",
+            "所有自然语言字段必须使用中文且包含中文汉字，禁止输出英文整句，不要直接复制英文摘要，不要输出 Markdown 代码块。",
             "",
             "Taxonomy:",
             json.dumps(taxonomy, ensure_ascii=False, indent=2),
@@ -1705,6 +1717,105 @@ def run_codex_batch(
             raise RuntimeError(f"codex output parse failed: {exc}") from exc
 
 
+def cache_fields_for_profile(profile: str = DEFAULT_PROFILE) -> Tuple[str, ...]:
+    profile = validate_profile(profile)
+    if profile == AUTONOMOUS_DRIVING_PROFILE:
+        return (
+            "id",
+            "relevance",
+            "driving_stack_category",
+            "technique_tags",
+            "problem_statement",
+            "method_summary",
+            "classification_reason",
+            "uncertainty",
+        )
+    return (
+        "id",
+        "relevance",
+        "primary_contribution",
+        "embodied_tasks",
+        "technique_tags",
+        "one_line_contribution",
+        "problem_statement",
+        "method_summary",
+        "classification_reason",
+        "uncertainty",
+    )
+
+
+def parse_json_object_text(text: str) -> Dict:
+    stripped = text.strip()
+    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", stripped, re.I | re.S)
+    if fence_match:
+        stripped = fence_match.group(1).strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(stripped):
+            if char != "{":
+                continue
+            try:
+                parsed, _end = decoder.raw_decode(stripped[index:])
+                break
+            except json.JSONDecodeError:
+                continue
+        else:
+            raise
+    if not isinstance(parsed, dict):
+        raise ValueError("expected JSON object")
+    return parsed
+
+
+def parse_traecli_json_response(stdout: str) -> Dict:
+    wrapper = parse_json_object_text(stdout)
+    message = wrapper.get("message")
+    if not isinstance(message, dict):
+        raise RuntimeError("traecli JSON missing message object")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("traecli JSON missing assistant content")
+    try:
+        return parse_json_object_text(content)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"traecli assistant content parse failed: {exc}") from exc
+
+
+def run_traecli_batch(
+    batch: Sequence[Dict],
+    timeout: int,
+    trae_model: str,
+    trae_thinking_effort: str,
+    trae_verbosity: str,
+    profile: str = DEFAULT_PROFILE,
+) -> Dict:
+    executable = shutil.which("traecli") or shutil.which("coco") or "traecli"
+    cmd = [
+        executable,
+        "-p",
+        "--json",
+        "--query-timeout",
+        f"{timeout}s",
+        "-c",
+        f"model.name={trae_model}",
+        "-c",
+        f"byted_gpt.thinking.thinking_effort={trae_thinking_effort}",
+        "-c",
+        f"byted_gpt.thinking.verbosity={trae_verbosity}",
+        build_codex_prompt(batch, profile=profile),
+    ]
+    completed = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        timeout=timeout + 30,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError((completed.stderr or completed.stdout or "traecli failed").strip())
+    return parse_traecli_json_response(completed.stdout)
+
+
 def classify_with_codex(
     papers: Sequence[Dict],
     llm_cache_path: Path,
@@ -1743,34 +1854,9 @@ def classify_with_codex(
                 normalized = normalize_classification(paper, candidate, "codex", profile=profile)
                 results.append(normalized)
                 if use_cache:
-                    cache_fields = (
-                        (
-                            "id",
-                            "relevance",
-                            "driving_stack_category",
-                            "technique_tags",
-                            "problem_statement",
-                            "method_summary",
-                            "classification_reason",
-                            "uncertainty",
-                        )
-                        if profile == AUTONOMOUS_DRIVING_PROFILE
-                        else (
-                            "id",
-                            "relevance",
-                            "primary_contribution",
-                            "embodied_tasks",
-                            "technique_tags",
-                            "one_line_contribution",
-                            "problem_statement",
-                            "method_summary",
-                            "classification_reason",
-                            "uncertainty",
-                        )
-                    )
                     cache[classification_cache_key(paper, profile=profile)] = {
                         key: normalized[key]
-                        for key in cache_fields
+                        for key in cache_fields_for_profile(profile)
                     }
             if use_cache:
                 write_llm_cache(llm_cache_path, cache, profile=profile)
@@ -1780,7 +1866,7 @@ def classify_with_codex(
                 fallback = classify_paper(paper, profile=profile)
                 fallback["classifier"] = "rules-fallback"
                 fallback["uncertainty"] = (
-                    fallback.get("uncertainty") or "Codex 分类失败，使用规则草稿兜底。"
+                    fallback.get("uncertainty") or "LLM 分类失败，使用规则草稿兜底。"
                 )
                 results.append(fallback)
     if use_cache:
@@ -1801,6 +1887,89 @@ def classify_with_codex(
     }
 
 
+def classify_with_traecli(
+    papers: Sequence[Dict],
+    llm_cache_path: Path,
+    batch_size: int,
+    timeout: int,
+    trae_model: str,
+    trae_thinking_effort: str,
+    trae_verbosity: str,
+    use_cache: bool,
+    profile: str = DEFAULT_PROFILE,
+) -> Tuple[List[Dict], Dict]:
+    profile = validate_profile(profile)
+    cache = load_llm_cache(llm_cache_path, profile=profile) if use_cache else {}
+    results: List[Dict] = []
+    missing: List[Dict] = []
+    cache_hits = 0
+    for paper in papers:
+        key = classification_cache_key(paper, profile=profile)
+        if use_cache and key in cache:
+            results.append(normalize_classification(paper, cache[key], "traecli-cache", profile=profile))
+            cache_hits += 1
+        else:
+            missing.append(paper)
+    errors: List[str] = []
+    calls = 0
+    for start in range(0, len(missing), batch_size):
+        batch = missing[start : start + batch_size]
+        try:
+            raw = run_traecli_batch(
+                batch,
+                timeout=timeout,
+                trae_model=trae_model,
+                trae_thinking_effort=trae_thinking_effort,
+                trae_verbosity=trae_verbosity,
+                profile=profile,
+            )
+            calls += 1
+            by_id = {
+                item.get("id"): item
+                for item in raw.get("papers", [])
+                if isinstance(item, dict) and item.get("id")
+            }
+            for paper in batch:
+                candidate = by_id.get(paper.get("id"), {})
+                normalized = normalize_classification(paper, candidate, "traecli", profile=profile)
+                results.append(normalized)
+                if use_cache:
+                    cache[classification_cache_key(paper, profile=profile)] = {
+                        key: normalized[key]
+                        for key in cache_fields_for_profile(profile)
+                    }
+            if use_cache:
+                write_llm_cache(llm_cache_path, cache, profile=profile)
+        except Exception as exc:
+            errors.append(str(exc))
+            for paper in batch:
+                fallback = classify_paper(paper, profile=profile)
+                fallback["classifier"] = "rules-fallback"
+                fallback["uncertainty"] = (
+                    fallback.get("uncertainty") or "TraeCLI 分类失败，使用规则草稿兜底。"
+                )
+                results.append(fallback)
+    if use_cache:
+        write_llm_cache(llm_cache_path, cache, profile=profile)
+    status_value = "ok"
+    if errors and calls == 0 and missing:
+        status_value = "fallback_rules"
+    elif errors:
+        status_value = "partial_fallback_rules"
+    return results, {
+        "classifier": "traecli",
+        "profile": profile,
+        "status": status_value,
+        "total": len(papers),
+        "cache_hits": cache_hits,
+        "traecli_calls": calls,
+        "trae_model": trae_model,
+        "trae_thinking_effort": trae_thinking_effort,
+        "trae_verbosity": trae_verbosity,
+        "errors": errors,
+    }
+
+
 def classify_and_partition(
     papers: Sequence[Dict],
     classifier: str,
@@ -1809,6 +1978,9 @@ def classify_and_partition(
     llm_batch_size: int = DEFAULT_LLM_BATCH_SIZE,
     classifier_timeout: int = DEFAULT_CLASSIFIER_TIMEOUT,
     codex_model: Optional[str] = None,
+    trae_model: str = DEFAULT_TRAE_MODEL,
+    trae_thinking_effort: str = DEFAULT_TRAE_THINKING_EFFORT,
+    trae_verbosity: str = DEFAULT_TRAE_VERBOSITY,
     use_llm_cache: bool = True,
 ) -> Tuple[List[Dict], List[Dict], Dict]:
     profile = validate_profile(profile)
@@ -1824,6 +1996,22 @@ def classify_and_partition(
             "selected": len(rule_selected),
             "rejected": len(rule_rejected),
         }
+    if classifier == "traecli":
+        trae_classified, status = classify_with_traecli(
+            rule_selected,
+            llm_cache_path=llm_cache_path,
+            profile=profile,
+            batch_size=llm_batch_size,
+            timeout=classifier_timeout,
+            trae_model=trae_model,
+            trae_thinking_effort=trae_thinking_effort,
+            trae_verbosity=trae_verbosity,
+            use_cache=use_llm_cache,
+        )
+        selected = [paper for paper in trae_classified if paper.get("relevance") != "none"]
+        rejected = rule_rejected + [paper for paper in trae_classified if paper.get("relevance") == "none"]
+        status.update({"selected": len(selected), "rejected": len(rejected), "rule_rejected": len(rule_rejected)})
+        return selected, rejected, status
     if classifier != "codex":
         raise ValueError(f"Unsupported classifier: {classifier}")
     codex_classified, status = classify_with_codex(
@@ -1991,7 +2179,7 @@ def render_markdown(
             f"selected {classifier_status.get('selected', len(papers))} / rejected {classifier_status.get('rejected', 0)}"
         )
         if classifier_status.get("errors"):
-            lines.append(f"  - 说明: Codex 分类失败或部分失败，已使用规则草稿兜底。")
+            lines.append(f"  - 说明: LLM 分类失败或部分失败，已使用规则草稿兜底。")
             for error in classifier_status.get("errors", [])[:3]:
                 lines.append(f"  - 错误: {truncate(str(error), 220)}")
     for status in statuses:
@@ -2113,11 +2301,14 @@ def collect(args: argparse.Namespace) -> Dict:
     selected, rejected, classifier_status = classify_and_partition(
         deduped,
         classifier=args.classifier,
-        llm_cache_path=out_dir / ".cache" / "codex-classifications.json",
+        llm_cache_path=classification_cache_path(out_dir, args.classifier),
         profile=profile,
         llm_batch_size=args.llm_batch_size,
         classifier_timeout=args.classifier_timeout,
         codex_model=args.codex_model,
+        trae_model=args.trae_model,
+        trae_thinking_effort=args.trae_thinking_effort,
+        trae_verbosity=args.trae_verbosity,
         use_llm_cache=not args.no_llm_cache,
     )
     markdown = render_markdown(
@@ -2169,11 +2360,24 @@ def build_parser() -> argparse.ArgumentParser:
         default_max = DEFAULT_DAILY_MAX_RESULTS if mode == "daily" else DEFAULT_WEEKLY_MAX_RESULTS
         sub.add_argument("--max-results", type=int, default=default_max, help="Maximum results per source")
         sub.add_argument("--no-cache", action="store_true", help="Ignore cached raw responses")
-        sub.add_argument("--classifier", choices=("codex", "rules"), default="codex", help="Paper classifier backend")
+        sub.add_argument("--classifier", choices=("codex", "traecli", "rules"), default="codex", help="Paper classifier backend")
         sub.add_argument("--codex-model", help="Optional model name for codex exec")
-        sub.add_argument("--llm-batch-size", type=int, default=DEFAULT_LLM_BATCH_SIZE, help="Papers per Codex classification batch")
-        sub.add_argument("--classifier-timeout", type=int, default=DEFAULT_CLASSIFIER_TIMEOUT, help="Codex classifier timeout in seconds")
-        sub.add_argument("--no-llm-cache", action="store_true", help="Ignore cached Codex classification results")
+        sub.add_argument("--trae-model", default=DEFAULT_TRAE_MODEL, help="TraeCLI model name")
+        sub.add_argument(
+            "--trae-thinking-effort",
+            choices=("low", "medium", "high"),
+            default=DEFAULT_TRAE_THINKING_EFFORT,
+            help="TraeCLI byted_gpt thinking effort",
+        )
+        sub.add_argument(
+            "--trae-verbosity",
+            choices=("low", "medium", "high"),
+            default=DEFAULT_TRAE_VERBOSITY,
+            help="TraeCLI byted_gpt verbosity",
+        )
+        sub.add_argument("--llm-batch-size", type=int, default=DEFAULT_LLM_BATCH_SIZE, help="Papers per LLM classification batch")
+        sub.add_argument("--classifier-timeout", type=int, default=DEFAULT_CLASSIFIER_TIMEOUT, help="LLM classifier timeout in seconds")
+        sub.add_argument("--no-llm-cache", action="store_true", help="Ignore cached LLM classification results")
         sub.add_argument("--timeout", type=int, default=20, help="HTTP timeout in seconds")
         sub.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="HTTP User-Agent")
     return parser

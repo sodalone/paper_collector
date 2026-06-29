@@ -12,7 +12,7 @@ description: Collect and classify AI papers from arXiv cs.RO and cs.CV with prof
 - `embodied`: 具身智能论文日报/周报，默认 profile。
 - `autonomous-driving`: 自动驾驶论文日报/周报。
 
-脚本默认用本机 `codex exec` 做 profile-specific 分类，输出本地 Markdown 报告和 `papers.json`；不写 Notion、飞书或邮件。
+脚本默认用本机 `codex exec` 做 profile-specific 分类，输出本地 Markdown 报告和 `papers.json`；不写 Notion、飞书或邮件。做论文分析和正式周报重生成时，优先使用 `traecli` 分类器，并指定 `GPT-5.5`、`thinking_effort=high`、`verbosity=high`。
 
 ## Workflow
 
@@ -31,6 +31,12 @@ python scripts/collect_arxiv.py weekly --profile autonomous-driving --out ../rep
 ```bash
 python scripts/collect_arxiv.py daily --profile embodied --date 2026-06-24 --out ../reports
 python scripts/collect_arxiv.py weekly --profile autonomous-driving --week 2026-W25 --out ../reports
+```
+
+正式重生成论文分析时优先使用 TraeCLI：
+
+```bash
+python scripts/collect_arxiv.py weekly --profile embodied --week 2026-W24 --out ../reports --classifier traecli --trae-model GPT-5.5 --trae-thinking-effort high --trae-verbosity high --no-cache --no-llm-cache
 ```
 
 默认日报是 Asia/Shanghai 的昨天自然日；默认周报是上一个完整自然周，周一到周日。
@@ -102,8 +108,10 @@ reports/
 - `--profile` 默认为 `embodied`，推荐显式传入。
 - `--sources` 默认为 `cs.RO,cs.CV`；不要自动扩到 `cs.AI`、`cs.LG`、`cs.CL`，除非用户明确要求。
 - `--max-results` 是每个 source 的最大抓取数。
-- `--classifier` 默认为 `codex`；需要离线快速草稿时用 `--classifier rules`。
+- `--classifier` 支持 `traecli`、`codex`、`rules`；正式论文分析优先 `traecli`，默认模型参数为 `--trae-model GPT-5.5 --trae-thinking-effort high --trae-verbosity high`；需要离线快速草稿时用 `--classifier rules`。
 - Codex 分类缓存位于输出目录的 `.cache/codex-classifications.json`，按 `profile + taxonomy_version + paper content` 隔离；需要强制重分时加 `--no-llm-cache`。
+- TraeCLI 分类缓存位于输出目录的 `.cache/traecli-classifications.json`，同样按 `profile + taxonomy_version + paper content` 隔离；重生成 Trae 分析缓存时加 `--no-llm-cache`。
+- LLM 分类输出中的 `解决问题`、`具体方法`、`分类理由` 等自然语言字段必须使用中文；英文摘要只能作为依据，不能直接复制到报告字段。
 - 脚本优先用 arXiv API；API 超时、`429` 或解析失败时使用 arXiv HTML recent 列表兜底，并在抓取状态里标注。
 
 ## Report Review

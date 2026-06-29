@@ -974,6 +974,85 @@ class CollectArxivTests(unittest.TestCase):
         self.assertEqual(weekly.llm_batch_size, 60)
         self.assertEqual(weekly.classifier_timeout, 600)
 
+    def test_parser_accepts_traecli_classifier_with_gpt55_high_defaults(self):
+        mod = load_module()
+        parser = mod.build_parser()
+
+        weekly = parser.parse_args(["weekly", "--classifier", "traecli"])
+
+        self.assertEqual(weekly.classifier, "traecli")
+        self.assertEqual(weekly.trae_model, "GPT-5.5")
+        self.assertEqual(weekly.trae_thinking_effort, "high")
+        self.assertEqual(weekly.trae_verbosity, "high")
+
+    def test_traecli_cache_path_is_separate_from_codex_cache(self):
+        mod = load_module()
+
+        self.assertEqual(
+            mod.classification_cache_path(Path("/tmp/reports"), "traecli"),
+            Path("/tmp/reports/.cache/traecli-classifications.json"),
+        )
+        self.assertEqual(
+            mod.classification_cache_path(Path("/tmp/reports"), "codex"),
+            Path("/tmp/reports/.cache/codex-classifications.json"),
+        )
+
+    def test_parse_traecli_json_response_reads_assistant_content_as_json(self):
+        mod = load_module()
+        payload = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "papers": [
+                                {
+                                    "id": "2606.00001v1",
+                                    "relevance": "none",
+                                    "primary_contribution": "",
+                                    "embodied_tasks": [],
+                                    "technique_tags": [],
+                                    "one_line_contribution": "",
+                                    "problem_statement": "不属于具身智能候选。",
+                                    "method_summary": "未提出具身智能方法。",
+                                    "classification_reason": "缺少机器人任务语境。",
+                                    "uncertainty": "",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            },
+            ensure_ascii=False,
+        )
+
+        parsed = mod.parse_traecli_json_response(payload)
+
+        self.assertEqual(parsed["papers"][0]["id"], "2606.00001v1")
+        self.assertEqual(parsed["papers"][0]["problem_statement"], "不属于具身智能候选。")
+
+    def test_embodied_llm_prompt_requires_chinese_problem_and_method_fields(self):
+        mod = load_module()
+        prompt = mod.build_codex_prompt(
+            [
+                {
+                    "id": "2606.00002v1",
+                    "base_id": "2606.00002",
+                    "title": "Robot Manipulation with World Models",
+                    "summary": "We solve long-horizon robot manipulation with a learned world model.",
+                    "categories": ["cs.RO"],
+                    "source_categories": ["cs.RO"],
+                }
+            ],
+            profile="embodied",
+        )
+
+        self.assertIn("必须使用中文", prompt)
+        self.assertIn("不要直接复制英文摘要", prompt)
+        self.assertIn("problem_statement", prompt)
+        self.assertIn("method_summary", prompt)
+
     def test_output_paths_are_profile_scoped(self):
         mod = load_module()
         window = mod.resolve_window("weekly", date_arg=None, week_arg="2026-W25")

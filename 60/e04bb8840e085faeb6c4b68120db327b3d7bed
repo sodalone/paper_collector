@@ -1,0 +1,110 @@
+tests/test_collect_arxiv.py
+  s_a289edc25d27a2::t_1735c41ea36fc0 80-136
+  s_66c2345bde6143::t_75d52334277565 1267-1410
+  s_66c2345bde6143::t_b5c0699b0e5190 1411-1471
+  s_a289edc25d27a2::t_d520c4b5f1ca29 60-79
+  s_a289edc25d27a2::t_0eae9c72bb707e 46-59
+collect-ai-arxiv/SKILL.md
+  s_a289edc25d27a2::t_b4cb03df4472d7 116,123-127
+"reports/embodied/weekly/具身智能 arXiv 2026-W29-0713-0719 周报.md"
+  s_20dfadbc87c440::t_ba992f98a7088c 9,11-14,2237-2264
+  s_20dfadbc87c440::t_dc088d613d6868 10,603-2229
+collect-ai-arxiv/scripts/collect_arxiv.py
+  s_66c2345bde6143::t_9a6c2d5cc7aff2 2132,2138-2143,2148,2150-2178,2181,2183-2184,2186-2189,2192-2197,2223-2225,2231-2246,2250,2252,2254-2257,2265,2270
+  s_a289edc25d27a2::t_a8adaf882ffd28 2625-2637,2680
+  s_a289edc25d27a2::t_7981515c2fc11f 1087-1098
+  s_66c2345bde6143::t_96c81547658688 2198-2222
+  s_66c2345bde6143::t_414405f0fdb99b 1966,1976,1985-1989,2004-2009
+  s_a289edc25d27a2::t_569f162492bdbc 1099-1116
+"reports/autonomous-driving/weekly/自动驾驶 arXiv 2026-W29-0713-0719 周报.md"
+  s_ddbcf3be3f5ee5::t_5f63b2a93947c4 1-253 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a66f5c87fe1b6b5ef89b92f","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Range":[1,253]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "60e04bb8840e085faeb6c4b68120db327b3d7bed",
+  "prompts": {},
+  "sessions": {
+    "s_20dfadbc87c440": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a5d7f507fe1b6b5ef886245",
+        "model": "gpt-5.6-sol__max",
+        "display_model_name": "GPT-5.6-Sol"
+      },
+      "human_author": "sodalone <soda791401863@gmail.com>"
+    },
+    "s_66c2345bde6143": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a5d840d7fe1b6b5ef886536",
+        "model": "gpt-5.6-sol__max"
+      },
+      "human_author": "sodalone <soda791401863@gmail.com>"
+    },
+    "s_a289edc25d27a2": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a59cc337fe1b6b5ef8853f8",
+        "model": "gpt-5.6-sol__max"
+      },
+      "human_author": "sodalone <soda791401863@gmail.com>"
+    },
+    "s_ddbcf3be3f5ee5": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a66b3137fe1b6b5ef89b1ce",
+        "model": "gpt-5.5__max",
+        "display_model_name": "GPT-5.5"
+      },
+      "human_author": "sodalone <soda791401863@gmail.com>"
+    }
+  },
+  "attestation_metadata": {
+    "reports/autonomous-driving/weekly/自动驾驶 arXiv 2026-W29-0713-0719 周报.md": [
+      {
+        "hash": "s_ddbcf3be3f5ee5::t_5f63b2a93947c4",
+        "line_ranges": [
+          {
+            "Range": [
+              1,
+              253
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a66f5c87fe1b6b5ef89b92f",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Range": [
+                  1,
+                  253
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_ddbcf3be3f5ee5": {
+      "tool": "trae",
+      "conversation_id": "6a66b3137fe1b6b5ef89b1ce",
+      "session_id": "6a66b3137fe1b6b5ef89b1ce",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ddbcf3be3f5ee5::t_5f63b2a93947c4": {
+      "tool": "trae",
+      "conversation_id": "6a66b3137fe1b6b5ef89b1ce",
+      "session_id": "6a66b3137fe1b6b5ef89b1ce",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}

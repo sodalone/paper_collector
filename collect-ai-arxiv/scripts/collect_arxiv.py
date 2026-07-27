@@ -30,6 +30,8 @@ DEFAULT_DAILY_MAX_RESULTS = 100
 DEFAULT_WEEKLY_MAX_RESULTS = 1000
 DEFAULT_LLM_BATCH_SIZE = 60
 DEFAULT_CLASSIFIER_TIMEOUT = 600
+DEFAULT_ABSTRACT_BATCH_SIZE = 50
+DEFAULT_ABSTRACT_ENRICHMENT_DELAY = 0.5
 DEFAULT_TRAE_MODEL = "GPT-5.5"
 DEFAULT_TRAE_THINKING_EFFORT = "high"
 DEFAULT_TRAE_VERBOSITY = "high"
@@ -838,6 +840,16 @@ def build_api_url(source: str, window: Window, start: int, max_results: int) -> 
     return f"{API_URL}?{params}"
 
 
+def build_api_id_url(arxiv_ids: Sequence[str]) -> str:
+    params = urllib.parse.urlencode(
+        {
+            "id_list": ",".join(arxiv_ids),
+            "max_results": len(arxiv_ids),
+        }
+    )
+    return f"{API_URL}?{params}"
+
+
 def parse_api_feed(xml_text: str, source: str) -> List[Dict]:
     root = ET.fromstring(xml_text)
     papers: List[Dict] = []
@@ -878,6 +890,183 @@ def parse_api_feed(xml_text: str, source: str) -> List[Dict]:
     return papers
 
 
+ATTR_RE = re.compile(r"""([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(["'])(.*?)\2""", re.S)
+
+
+def html_attrs(tag: str) -> Dict[str, str]:
+    return {name.lower(): unescape(value) for name, _quote, value in ATTR_RE.findall(tag)}
+
+
+def html_meta_values(html: str, name: str) -> List[str]:
+    values = []
+    target = name.lower()
+    for tag in re.findall(r"<meta\b[^>]*>", html, flags=re.I | re.S):
+        attrs = html_attrs(tag)
+        if attrs.get("name", "").lower() != target:
+            continue
+        content = WHITESPACE_RE.sub(" ", attrs.get("content", "")).strip()
+        if content:
+            values.append(content)
+    return values
+
+
+def parse_abs_html(html: str, fallback_paper: Dict) -> Dict:
+    arxiv_id = fallback_paper.get("id", "")
+    title_values = html_meta_values(html, "citation_title")
+    title = title_values[0] if title_values else ""
+    if not title:
+        title_match = re.search(
+            r"""<h1\b[^>]*class\s*=\s*["'][^"']*\btitle\b[^"']*["'][^>]*>(.*?)</h1>""",
+            html,
+            re.I | re.S,
+        )
+        if title_match:
+            title = re.sub(r"^Title:\s*", "", strip_tags(title_match.group(1))).strip()
+
+    abstract_values = html_meta_values(html, "citation_abstract")
+    summary = abstract_values[0] if abstract_values else ""
+    if not summary:
+        abstract_match = re.search(
+            r"""<blockquote\b[^>]*class\s*=\s*["'][^"']*\babstract\b[^"']*["'][^>]*>(.*?)</blockquote>""",
+            html,
+            re.I | re.S,
+        )
+        if abstract_match:
+            summary = re.sub(r"^Abstract:\s*", "", strip_tags(abstract_match.group(1))).strip()
+
+    date_values = html_meta_values(html, "citation_date")
+    published = date_values[0].replace("/", "-") if date_values else ""
+    pdf_values = html_meta_values(html, "citation_pdf_url")
+    authors = html_meta_values(html, "citation_author")
+
+    categories = []
+    subjects_match = re.search(
+        r"""<td\b[^>]*class\s*=\s*["'][^"']*\bsubjects\b[^"']*["'][^>]*>(.*?)</td>""",
+        html,
+        re.I | re.S,
+    )
+    if subjects_match:
+        categories = sorted(set(re.findall(r"\(([a-z-]+\.[A-Z]{2})\)", strip_tags(subjects_match.group(1)))))
+
+    return {
+        "id": arxiv_id,
+        "base_id": fallback_paper.get("base_id") or base_arxiv_id(arxiv_id),
+        "title": title,
+        "summary": summary,
+        "authors": authors,
+        "published": published,
+        "updated": published,
+        "abs_url": fallback_paper.get("abs_url") or f"https://arxiv.org/abs/{arxiv_id}",
+        "pdf_url": pdf_values[0] if pdf_values else fallback_paper.get("pdf_url", ""),
+        "categories": categories,
+    }
+
+
+def merge_enriched_paper(paper: Dict, enriched: Dict) -> Dict:
+    merged = dict(paper)
+    for field in ("title", "summary", "published", "updated", "abs_url", "pdf_url"):
+        if enriched.get(field):
+            merged[field] = enriched[field]
+    if enriched.get("authors"):
+        merged["authors"] = enriched["authors"]
+    if enriched.get("categories"):
+        merged["categories"] = sorted(set(merged.get("categories") or []) | set(enriched["categories"]))
+    if merged.get("summary"):
+        old_uncertainty = merged.get("uncertainty", "")
+        if "摘要" in old_uncertainty:
+            merged["uncertainty"] = "HTML fallback 未提供精确提交时间，摘要已补全；提交时间仍需复核。"
+        elif old_uncertainty:
+            merged["uncertainty"] = old_uncertainty
+        else:
+            merged["uncertainty"] = ""
+        if merged.get("fetch_method") == "html-fallback":
+            merged["fetch_method"] = "html-fallback+abstract"
+    return merged
+
+
+def enrich_missing_summaries(
+    papers: Sequence[Dict],
+    raw_dir: Path,
+    no_cache: bool,
+    timeout: int,
+    user_agent: str,
+    batch_size: int = DEFAULT_ABSTRACT_BATCH_SIZE,
+    delay_seconds: float = DEFAULT_ABSTRACT_ENRICHMENT_DELAY,
+) -> Tuple[List[Dict], Dict]:
+    enriched_papers = [dict(paper) for paper in papers]
+    missing = [paper for paper in enriched_papers if not paper.get("summary")]
+    status = {
+        "source": "abstract-enrichment",
+        "method": "api-id-list+abs-html",
+        "status": "skipped",
+        "count": 0,
+        "attempted": len(missing),
+        "failed": 0,
+    }
+    if not missing:
+        return enriched_papers, status
+
+    errors = []
+    batch_size = max(1, batch_size)
+    for start in range(0, len(missing), batch_size):
+        batch = missing[start : start + batch_size]
+        arxiv_ids = [paper.get("id") or paper.get("base_id", "") for paper in batch]
+        arxiv_ids = [arxiv_id for arxiv_id in arxiv_ids if arxiv_id]
+        if not arxiv_ids:
+            continue
+        url = build_api_id_url(arxiv_ids)
+        digest = hashlib.sha1(",".join(arxiv_ids).encode("utf-8")).hexdigest()
+        cache_path = raw_dir / f"{cache_key(['abs-api', digest])}.xml"
+        try:
+            xml_text, _cached = read_url(url, cache_path, no_cache, timeout, user_agent)
+            api_papers = parse_api_feed(xml_text, "arxiv")
+            by_base = {paper.get("base_id") or base_arxiv_id(paper.get("id", "")): paper for paper in api_papers}
+            for index, paper in enumerate(enriched_papers):
+                if paper.get("summary"):
+                    continue
+                enriched = by_base.get(paper.get("base_id") or base_arxiv_id(paper.get("id", "")))
+                if enriched and enriched.get("summary"):
+                    enriched_papers[index] = merge_enriched_paper(paper, enriched)
+        except Exception as exc:
+            errors.append(f"api-id-list {arxiv_ids[0]}..{arxiv_ids[-1]}: {exc}")
+        if delay_seconds and start + batch_size < len(missing):
+            time.sleep(delay_seconds)
+
+    for index, paper in enumerate(enriched_papers):
+        if paper.get("summary"):
+            continue
+        arxiv_id = paper.get("id") or paper.get("base_id", "")
+        if not arxiv_id:
+            continue
+        url = paper.get("abs_url") or f"https://arxiv.org/abs/{arxiv_id}"
+        cache_path = raw_dir / f"{cache_key(['abs-html', arxiv_id])}.html"
+        try:
+            html, _cached = read_url(url, cache_path, no_cache, timeout, user_agent)
+            enriched = parse_abs_html(html, paper)
+            if enriched.get("summary"):
+                enriched_papers[index] = merge_enriched_paper(paper, enriched)
+        except Exception as exc:
+            errors.append(f"abs-html {arxiv_id}: {exc}")
+        if delay_seconds:
+            time.sleep(delay_seconds)
+
+    enriched_count = sum(1 for paper in enriched_papers if paper.get("summary")) - sum(
+        1 for paper in papers if paper.get("summary")
+    )
+    failed = len(missing) - enriched_count
+    status["count"] = enriched_count
+    status["failed"] = failed
+    if failed == 0:
+        status["status"] = "ok"
+    elif enriched_count:
+        status["status"] = "partial"
+    else:
+        status["status"] = "failed"
+    if errors:
+        status["note"] = "; ".join(errors[:3])
+    return enriched_papers, status
+
+
 def parse_list_heading_date(heading_html: str) -> Optional[date]:
     text = strip_tags(heading_html)
     match = re.search(r"\b[A-Z][a-z]{2},\s+\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}\b", text)
@@ -893,6 +1082,36 @@ def date_in_window(day: Optional[date], window: Optional[Window]) -> bool:
     if day is None or window is None:
         return True
     return window.start_local.date() <= day < window.end_local.date()
+
+
+def submission_local_date(value: str) -> Optional[date]:
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})", value or "")
+    if not match:
+        return None
+    try:
+        if "T" in value and value.endswith("Z"):
+            return datetime.fromisoformat(value[:-1] + "+00:00").astimezone(SHANGHAI).date()
+        return date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+
+
+def partition_submission_window(papers: Sequence[Dict], window: Window) -> Tuple[List[Dict], List[Dict]]:
+    kept = []
+    removed = []
+    for paper in papers:
+        submitted = submission_local_date(paper.get("published") or paper.get("updated", ""))
+        if date_in_window(submitted, window):
+            kept.append(paper)
+            continue
+        removed_paper = dict(paper)
+        note = (
+            f"提交日期 {submitted.isoformat()} 不在报告窗口内，"
+            "由 HTML fallback 公告日期口径引入，已剔除。"
+        )
+        removed_paper["uncertainty"] = f"{paper.get('uncertainty', '').strip()} {note}".strip()
+        removed.append(removed_paper)
+    return kept, removed
 
 
 def parse_list_html(html: str, source: str, limit: int, window: Optional[Window] = None) -> List[Dict]:
@@ -1744,7 +1963,7 @@ def cache_fields_for_profile(profile: str = DEFAULT_PROFILE) -> Tuple[str, ...]:
     )
 
 
-def parse_json_object_text(text: str) -> Dict:
+def parse_json_value_text(text: str) -> object:
     stripped = text.strip()
     fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", stripped, re.I | re.S)
     if fence_match:
@@ -1754,7 +1973,7 @@ def parse_json_object_text(text: str) -> Dict:
     except json.JSONDecodeError:
         decoder = json.JSONDecoder()
         for index, char in enumerate(stripped):
-            if char != "{":
+            if char not in "{[":
                 continue
             try:
                 parsed, _end = decoder.raw_decode(stripped[index:])
@@ -1763,6 +1982,11 @@ def parse_json_object_text(text: str) -> Dict:
                 continue
         else:
             raise
+    return parsed
+
+
+def parse_json_object_text(text: str) -> Dict:
+    parsed = parse_json_value_text(text)
     if not isinstance(parsed, dict):
         raise ValueError("expected JSON object")
     return parsed
@@ -1777,7 +2001,12 @@ def parse_traecli_json_response(stdout: str) -> Dict:
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("traecli JSON missing assistant content")
     try:
-        return parse_json_object_text(content)
+        parsed = parse_json_value_text(content)
+        if isinstance(parsed, list):
+            return {"papers": parsed}
+        if not isinstance(parsed, dict):
+            raise ValueError("expected JSON object or array")
+        return parsed
     except (json.JSONDecodeError, ValueError) as exc:
         raise RuntimeError(f"traecli assistant content parse failed: {exc}") from exc
 
@@ -1900,62 +2129,132 @@ def classify_with_traecli(
 ) -> Tuple[List[Dict], Dict]:
     profile = validate_profile(profile)
     cache = load_llm_cache(llm_cache_path, profile=profile) if use_cache else {}
-    results: List[Dict] = []
+    results_by_key: Dict[str, Dict] = {}
     missing: List[Dict] = []
     cache_hits = 0
     for paper in papers:
         key = classification_cache_key(paper, profile=profile)
         if use_cache and key in cache:
-            results.append(normalize_classification(paper, cache[key], "traecli-cache", profile=profile))
+            results_by_key[key] = normalize_classification(
+                paper,
+                cache[key],
+                "traecli-cache",
+                profile=profile,
+            )
             cache_hits += 1
         else:
             missing.append(paper)
     errors: List[str] = []
+    recovered_errors: List[str] = []
     calls = 0
+    single_paper_retries = 0
+    fallback_count = 0
+
+    def invoke(batch: Sequence[Dict]) -> Dict:
+        nonlocal calls
+        calls += 1
+        return run_traecli_batch(
+            batch,
+            timeout=timeout,
+            trae_model=trae_model,
+            trae_thinking_effort=trae_thinking_effort,
+            trae_verbosity=trae_verbosity,
+            profile=profile,
+        )
+
+    def complete_candidate(candidate: object, expected_id: str) -> bool:
+        if not isinstance(candidate, dict) or candidate.get("id") != expected_id:
+            return False
+        if candidate.get("relevance") not in RELEVANCE_TIERS:
+            return False
+        natural_language_fields = ["problem_statement", "method_summary", "classification_reason"]
+        if profile == EMBODIED_PROFILE:
+            natural_language_fields.append("one_line_contribution")
+        return all(
+            isinstance(candidate.get(field), str)
+            and re.search(r"[\u3400-\u9fff]", candidate[field])
+            for field in natural_language_fields
+        )
+
     for start in range(0, len(missing), batch_size):
         batch = missing[start : start + batch_size]
+        by_id: Dict[str, Dict] = {}
         try:
-            raw = run_traecli_batch(
-                batch,
-                timeout=timeout,
-                trae_model=trae_model,
-                trae_thinking_effort=trae_thinking_effort,
-                trae_verbosity=trae_verbosity,
-                profile=profile,
-            )
-            calls += 1
+            raw = invoke(batch)
+            candidates = raw.get("papers", []) if isinstance(raw, dict) else []
             by_id = {
-                item.get("id"): item
-                for item in raw.get("papers", [])
-                if isinstance(item, dict) and item.get("id")
+                paper.get("id"): candidate
+                for paper in batch
+                for candidate in candidates
+                if complete_candidate(candidate, paper.get("id", ""))
             }
-            for paper in batch:
-                candidate = by_id.get(paper.get("id"), {})
-                normalized = normalize_classification(paper, candidate, "traecli", profile=profile)
-                results.append(normalized)
-                if use_cache:
-                    cache[classification_cache_key(paper, profile=profile)] = {
-                        key: normalized[key]
-                        for key in cache_fields_for_profile(profile)
-                    }
-            if use_cache:
-                write_llm_cache(llm_cache_path, cache, profile=profile)
         except Exception as exc:
-            errors.append(str(exc))
-            for paper in batch:
+            recovered_errors.append(f"batch retry required: {exc}")
+
+        for paper in batch:
+            paper_id = paper.get("id", "")
+            candidate = by_id.get(paper_id)
+            if candidate is None:
+                retry_errors = []
+                for _attempt in range(3):
+                    single_paper_retries += 1
+                    try:
+                        retry_raw = invoke([paper])
+                        retry_candidates = retry_raw.get("papers", []) if isinstance(retry_raw, dict) else []
+                        matches = [
+                            item
+                            for item in retry_candidates
+                            if complete_candidate(item, paper_id)
+                        ]
+                        if len(matches) != 1:
+                            raise RuntimeError(
+                                f"expected one complete classification for {paper_id}, got {len(matches)}"
+                            )
+                        candidate = matches[0]
+                        break
+                    except Exception as exc:
+                        retry_errors.append(str(exc))
+                if candidate is None:
+                    errors.append(f"{paper_id}: {'; '.join(retry_errors)}")
+                elif retry_errors:
+                    recovered_errors.append(
+                        f"{paper_id}: recovered after {len(retry_errors)} failed single-paper retries"
+                    )
+            key = classification_cache_key(paper, profile=profile)
+            if candidate is None:
+                fallback_count += 1
                 fallback = classify_paper(paper, profile=profile)
                 fallback["classifier"] = "rules-fallback"
                 fallback["uncertainty"] = (
                     fallback.get("uncertainty") or "TraeCLI 分类失败，使用规则草稿兜底。"
                 )
-                results.append(fallback)
+                results_by_key[key] = fallback
+                continue
+            normalized = normalize_classification(
+                paper,
+                candidate,
+                "traecli",
+                profile=profile,
+            )
+            results_by_key[key] = normalized
+            if use_cache:
+                cache[key] = {
+                    field: normalized[field]
+                    for field in cache_fields_for_profile(profile)
+                }
+        if use_cache:
+            write_llm_cache(llm_cache_path, cache, profile=profile)
     if use_cache:
         write_llm_cache(llm_cache_path, cache, profile=profile)
     status_value = "ok"
-    if errors and calls == 0 and missing:
+    if fallback_count == len(missing) and missing:
         status_value = "fallback_rules"
-    elif errors:
+    elif fallback_count:
         status_value = "partial_fallback_rules"
+    results = [
+        results_by_key[classification_cache_key(paper, profile=profile)]
+        for paper in papers
+    ]
     return results, {
         "classifier": "traecli",
         "profile": profile,
@@ -1963,10 +2262,12 @@ def classify_with_traecli(
         "total": len(papers),
         "cache_hits": cache_hits,
         "traecli_calls": calls,
+        "single_paper_retries": single_paper_retries,
         "trae_model": trae_model,
         "trae_thinking_effort": trae_thinking_effort,
         "trae_verbosity": trae_verbosity,
         "errors": errors,
+        "recovered_errors": recovered_errors,
     }
 
 
@@ -2058,30 +2359,32 @@ def truncate(text: str, limit: int = 360) -> str:
 
 def format_embodied_paper(paper: Dict, index: int) -> str:
     tags = ", ".join(paper.get("technique_tags", [])) or "无"
+    child_indent = " " * len(f"{index}. ")
     return "\n".join(
         [
             f"{index}. **[{paper.get('title', 'Untitled')}]({paper.get('abs_url', '')})**",
-            f"   - 六类分类: `{paper.get('primary_contribution') or '未分类'}`",
-            f"   - 相关度: `{paper.get('relevance')}`",
-            f"   - 技术标签: {tags}",
-            f"   - 解决问题: {paper.get('problem_statement', '')}",
-            f"   - 具体方法: {paper.get('method_summary', '')}",
-            f"   - 分类理由: {paper.get('classification_reason', '')}",
+            f"{child_indent}- 六类分类: `{paper.get('primary_contribution') or '未分类'}`",
+            f"{child_indent}- 相关度: `{paper.get('relevance')}`",
+            f"{child_indent}- 技术标签: {tags}",
+            f"{child_indent}- 解决问题: {paper.get('problem_statement', '')}",
+            f"{child_indent}- 具体方法: {paper.get('method_summary', '')}",
+            f"{child_indent}- 分类理由: {paper.get('classification_reason', '')}",
         ]
     )
 
 
 def format_driving_paper(paper: Dict, index: int) -> str:
     tags = ", ".join(paper.get("technique_tags", [])) or "无"
+    child_indent = " " * len(f"{index}. ")
     return "\n".join(
         [
             f"{index}. **[{paper.get('title', 'Untitled')}]({paper.get('abs_url', '')})**",
-            f"   - 四类分类: `{paper.get('driving_stack_category') or '未分类'}`",
-            f"   - 相关度: `{paper.get('relevance')}`",
-            f"   - 技术标签: {tags}",
-            f"   - 解决问题: {paper.get('problem_statement', '')}",
-            f"   - 具体方法: {paper.get('method_summary', '')}",
-            f"   - 分类理由: {paper.get('classification_reason', '')}",
+            f"{child_indent}- 四类分类: `{paper.get('driving_stack_category') or '未分类'}`",
+            f"{child_indent}- 相关度: `{paper.get('relevance')}`",
+            f"{child_indent}- 技术标签: {tags}",
+            f"{child_indent}- 解决问题: {paper.get('problem_statement', '')}",
+            f"{child_indent}- 具体方法: {paper.get('method_summary', '')}",
+            f"{child_indent}- 分类理由: {paper.get('classification_reason', '')}",
         ]
     )
 
@@ -2298,6 +2601,40 @@ def collect(args: argparse.Namespace) -> Dict:
         if index < len(sources) - 1 and status.get("method") == "api":
             time.sleep(3)
     deduped = dedupe_papers(papers)
+    summary_candidates = [
+        paper
+        for paper in deduped
+        if not paper.get("summary") and classify_paper(paper, profile=profile).get("relevance") != "none"
+    ]
+    if summary_candidates:
+        enriched_candidates, enrichment_status = enrich_missing_summaries(
+            summary_candidates,
+            raw_dir=raw_dir,
+            no_cache=args.no_cache,
+            timeout=args.timeout,
+            user_agent=args.user_agent,
+        )
+        statuses.append(enrichment_status)
+        enriched_by_base = {
+            paper.get("base_id") or base_arxiv_id(paper.get("id", "")): paper for paper in enriched_candidates
+        }
+        deduped = [
+            enriched_by_base.get(paper.get("base_id") or base_arxiv_id(paper.get("id", "")), paper)
+            for paper in deduped
+        ]
+    deduped, out_of_window = partition_submission_window(deduped, window)
+    statuses.append(
+        {
+            "source": "submission-window-filter",
+            "method": "submitted-date",
+            "status": "ok",
+            "count": len(deduped),
+            "note": (
+                f"按提交日期口径剔除 {len(out_of_window)} 篇窗口外论文"
+                "（HTML fallback 公告日期可能引入跨周论文）"
+            ),
+        }
+    )
     selected, rejected, classifier_status = classify_and_partition(
         deduped,
         classifier=args.classifier,
@@ -2340,6 +2677,7 @@ def collect(args: argparse.Namespace) -> Dict:
         "classifier_status": classifier_status,
         "papers": selected,
         "rejected_papers": rejected,
+        "out_of_window_papers": out_of_window,
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"report_path": str(report_path), "json_path": str(json_path), "raw_dir": str(raw_dir)}

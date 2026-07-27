@@ -43,6 +43,97 @@ class CollectArxivTests(unittest.TestCase):
         self.assertEqual(window.start_utc.strftime("%Y%m%d%H%M"), "202606141600")
         self.assertEqual(window.end_utc.strftime("%Y%m%d%H%M"), "202606211600")
 
+    def test_submission_local_date_parses_utc_timestamp_and_bare_date(self):
+        mod = load_module()
+
+        self.assertEqual(
+            mod.submission_local_date("2026-07-13T20:00:00Z"),
+            datetime.fromisoformat("2026-07-14").date(),
+        )
+        self.assertEqual(
+            mod.submission_local_date("2026-07-09"),
+            datetime.fromisoformat("2026-07-09").date(),
+        )
+        self.assertIsNone(mod.submission_local_date(""))
+        self.assertIsNone(mod.submission_local_date("not-a-date"))
+
+    def test_partition_submission_window_drops_outside_and_keeps_undated(self):
+        mod = load_module()
+        window = mod.resolve_window(
+            "weekly",
+            date_arg=None,
+            week_arg="2026-W29",
+            now=datetime.fromisoformat("2026-07-17T10:30:00+08:00"),
+        )
+        papers = [
+            {"id": "2607.13001", "published": "2026-07-13T00:00:00Z"},
+            {"id": "2607.09001", "published": "2026-07-09", "uncertainty": "HTML fallback"},
+            {"id": "unknown", "published": ""},
+        ]
+
+        kept, removed = mod.partition_submission_window(papers, window)
+
+        self.assertEqual([paper["id"] for paper in kept], ["2607.13001", "unknown"])
+        self.assertEqual([paper["id"] for paper in removed], ["2607.09001"])
+        self.assertIn("提交日期 2026-07-09 不在报告窗口内", removed[0]["uncertainty"])
+
+    def test_collect_filters_submission_window_and_writes_audit_records(self):
+        mod = load_module()
+
+        def fake_fetch_source(source, **_kwargs):
+            return (
+                [
+                    {
+                        "id": "2607.09001",
+                        "base_id": "2607.09001",
+                        "title": "Robot Navigation with Semantic Memory",
+                        "summary": "A robot navigation policy uses semantic memory.",
+                        "authors": ["Ada Lovelace"],
+                        "published": "2026-07-09",
+                        "updated": "2026-07-09",
+                        "abs_url": "https://arxiv.org/abs/2607.09001",
+                        "pdf_url": "https://arxiv.org/pdf/2607.09001",
+                        "categories": [source],
+                        "source_category": source,
+                        "source_categories": [source],
+                        "fetch_method": "html-fallback+abstract",
+                    }
+                ],
+                {"source": source, "method": "html-fallback", "status": "ok", "count": 1},
+            )
+
+        original_fetch_source = mod.fetch_source
+        mod.fetch_source = fake_fetch_source
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                args = mod.build_parser().parse_args(
+                    [
+                        "weekly",
+                        "--profile",
+                        "embodied",
+                        "--week",
+                        "2026-W29",
+                        "--out",
+                        tmp,
+                        "--sources",
+                        "cs.RO",
+                        "--classifier",
+                        "rules",
+                    ]
+                )
+                result = mod.collect(args)
+                payload = json.loads(Path(result["json_path"]).read_text(encoding="utf-8"))
+        finally:
+            mod.fetch_source = original_fetch_source
+
+        self.assertEqual(payload["papers"], [])
+        self.assertEqual(
+            [paper["id"] for paper in payload["out_of_window_papers"]],
+            ["2607.09001"],
+        )
+        status = next(item for item in payload["statuses"] if item["source"] == "submission-window-filter")
+        self.assertIn("剔除 1 篇窗口外论文", status["note"])
+
     def test_dedupe_merges_sources_and_categories_by_base_arxiv_id(self):
         mod = load_module()
         papers = [
@@ -716,6 +807,46 @@ class CollectArxivTests(unittest.TestCase):
         self.assertIn("[HoloAgent-0]", navigation_section)
         self.assertLess(navigation_section.index("[HoloAgent-0]"), navigation_section.index("[Medium Navigation Paper]"))
 
+    def test_render_markdown_preserves_ordered_numbers_after_ten(self):
+        mod = load_module()
+        window = mod.resolve_window(
+            "daily",
+            date_arg="2026-06-23",
+            week_arg=None,
+            now=datetime.fromisoformat("2026-06-24T10:30:00+08:00"),
+        )
+        papers = []
+        for index in range(12):
+            papers.append(
+                {
+                    "id": f"2606.{index:05d}v1",
+                    "base_id": f"2606.{index:05d}",
+                    "title": f"Navigation Paper {index}",
+                    "abs_url": f"https://arxiv.org/abs/2606.{index:05d}v1",
+                    "primary_contribution": "Policy/Control/Planning",
+                    "embodied_tasks": ["Navigation"],
+                    "technique_tags": ["navigation"],
+                    "relevance": "high",
+                    "problem_statement": "机器人导航需要稳定规划。",
+                    "method_summary": "提出导航规划方法。",
+                    "classification_reason": "核心任务是导航。",
+                }
+            )
+
+        report = mod.render_markdown(mode="daily", window=window, papers=papers, statuses=[])
+        navigation_section = report.split("### Navigation", 1)[1].split("## 抓取状态", 1)[0]
+
+        self.assertIn("\n10. **[Navigation Paper", navigation_section)
+        self.assertIn("\n11. **[Navigation Paper", navigation_section)
+        self.assertIn("\n12. **[Navigation Paper", navigation_section)
+        lines = navigation_section.splitlines()
+        for marker in ("10.", "11.", "12."):
+            line_index = next(index for index, line in enumerate(lines) if line.startswith(marker))
+            self.assertTrue(
+                lines[line_index + 1].startswith(" " * (len(marker) + 1) + "- "),
+                lines[line_index + 1],
+            )
+
     def test_render_markdown_weekly_title_includes_week_label_and_shanghai_dates(self):
         mod = load_module()
         window = mod.resolve_window(
@@ -830,6 +961,107 @@ class CollectArxivTests(unittest.TestCase):
         self.assertEqual(status["count"], 1)
         self.assertEqual(papers[0]["id"], "2606.11111v1")
         self.assertEqual(papers[0]["title"], "Robot Navigation Benchmark")
+
+    def test_parse_abs_html_extracts_title_abstract_authors_and_categories(self):
+        mod = load_module()
+        html = """
+        <html>
+          <head>
+            <meta name="citation_title" content="Robot Navigation with Semantic Memory" />
+            <meta name="citation_author" content="Ada Lovelace" />
+            <meta name="citation_author" content="Alan Turing" />
+            <meta name="citation_date" content="2026/07/03" />
+            <meta name="citation_pdf_url" content="https://arxiv.org/pdf/2607.12345" />
+          </head>
+          <body>
+            <blockquote class="abstract mathjax">
+              <span class="descriptor">Abstract:</span>
+              We introduce a robot navigation system that builds semantic memory from images.
+            </blockquote>
+            <td class="tablecell subjects">
+              Robotics (cs.RO); Computer Vision and Pattern Recognition (cs.CV)
+            </td>
+          </body>
+        </html>
+        """
+
+        parsed = mod.parse_abs_html(html, {"id": "2607.12345", "base_id": "2607.12345"})
+
+        self.assertEqual(parsed["id"], "2607.12345")
+        self.assertEqual(parsed["title"], "Robot Navigation with Semantic Memory")
+        self.assertEqual(
+            parsed["summary"],
+            "We introduce a robot navigation system that builds semantic memory from images.",
+        )
+        self.assertEqual(parsed["authors"], ["Ada Lovelace", "Alan Turing"])
+        self.assertEqual(parsed["categories"], ["cs.CV", "cs.RO"])
+        self.assertEqual(parsed["published"], "2026-07-03")
+        self.assertEqual(parsed["pdf_url"], "https://arxiv.org/pdf/2607.12345")
+
+    def test_enrich_missing_summaries_uses_arxiv_id_api_for_html_fallback_papers(self):
+        mod = load_module()
+        calls = []
+        paper = {
+            "id": "2607.12345",
+            "base_id": "2607.12345",
+            "title": "Robot Navigation with Semantic Memory",
+            "summary": "",
+            "authors": [],
+            "categories": ["cs.RO"],
+            "source_category": "cs.RO",
+            "source_categories": ["cs.RO"],
+            "abs_url": "https://arxiv.org/abs/2607.12345",
+            "pdf_url": "https://arxiv.org/pdf/2607.12345",
+            "fetch_method": "html-fallback",
+            "uncertainty": "HTML fallback 未提供精确提交时间和摘要，需要人工复核。",
+        }
+        feed = """<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+          <entry>
+            <id>http://arxiv.org/abs/2607.12345</id>
+            <updated>2026-07-03T00:00:00Z</updated>
+            <published>2026-07-03T00:00:00Z</published>
+            <title>Robot Navigation with Semantic Memory</title>
+            <summary>We introduce a robot navigation system that builds semantic memory from images.</summary>
+            <author><name>Ada Lovelace</name></author>
+            <arxiv:primary_category term="cs.RO" />
+            <category term="cs.RO" />
+            <category term="cs.CV" />
+            <link href="http://arxiv.org/abs/2607.12345" rel="alternate" type="text/html" />
+            <link title="pdf" href="http://arxiv.org/pdf/2607.12345" rel="related" type="application/pdf" />
+          </entry>
+        </feed>"""
+
+        def fake_read_url(url, cache_path, no_cache, timeout, user_agent):
+            calls.append(url)
+            return feed, False
+
+        original_read_url = mod.read_url
+        original_sleep = mod.time.sleep
+        mod.read_url = fake_read_url
+        mod.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                enriched, status = mod.enrich_missing_summaries(
+                    [paper],
+                    raw_dir=Path(tmp),
+                    no_cache=False,
+                    timeout=1,
+                    user_agent="test",
+                    batch_size=10,
+                    delay_seconds=0,
+                )
+        finally:
+            mod.read_url = original_read_url
+            mod.time.sleep = original_sleep
+
+        self.assertEqual(enriched[0]["summary"], "We introduce a robot navigation system that builds semantic memory from images.")
+        self.assertEqual(enriched[0]["categories"], ["cs.CV", "cs.RO"])
+        self.assertIn("摘要已补全", enriched[0]["uncertainty"])
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["count"], 1)
+        self.assertEqual(status["attempted"], 1)
+        self.assertIn("id_list=2607.12345", calls[0])
 
     def test_html_fallback_parses_real_arxiv_markup_and_filters_window_date(self):
         mod = load_module()
@@ -1031,6 +1263,211 @@ class CollectArxivTests(unittest.TestCase):
 
         self.assertEqual(parsed["papers"][0]["id"], "2606.00001v1")
         self.assertEqual(parsed["papers"][0]["problem_statement"], "不属于具身智能候选。")
+
+    def test_parse_traecli_json_response_wraps_assistant_array_as_papers(self):
+        mod = load_module()
+        papers = [
+            {
+                "id": "2606.00001v1",
+                "relevance": "none",
+                "primary_contribution": "",
+                "embodied_tasks": [],
+                "technique_tags": [],
+                "one_line_contribution": "不属于具身智能候选。",
+                "problem_statement": "不属于具身智能候选。",
+                "method_summary": "未提出具身智能方法。",
+                "classification_reason": "缺少机器人任务语境。",
+                "uncertainty": "",
+            }
+        ]
+        payload = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(papers, ensure_ascii=False),
+                }
+            },
+            ensure_ascii=False,
+        )
+
+        parsed = mod.parse_traecli_json_response(payload)
+
+        self.assertEqual(parsed, {"papers": papers})
+
+    def test_traecli_retries_missing_batch_results_individually(self):
+        mod = load_module()
+        papers = [
+            {
+                "id": f"2606.0000{index}v1",
+                "base_id": f"2606.0000{index}",
+                "title": f"Autonomous Driving Paper {index}",
+                "summary": "An autonomous driving perception method for road scenes.",
+                "categories": ["cs.CV"],
+                "source_categories": ["cs.CV"],
+            }
+            for index in (1, 2)
+        ]
+        calls = []
+
+        def candidate(paper):
+            return {
+                "id": paper["id"],
+                "relevance": "high",
+                "driving_stack_category": "Perception",
+                "technique_tags": ["camera"],
+                "problem_statement": "自动驾驶感知需要可靠理解道路场景。",
+                "method_summary": "方法使用相机特征完成道路场景感知。",
+                "classification_reason": "核心贡献属于自动驾驶感知。",
+                "uncertainty": "",
+            }
+
+        def fake_run(batch, **_kwargs):
+            calls.append([paper["id"] for paper in batch])
+            if len(batch) > 1:
+                return {"papers": [candidate(batch[0])]}
+            return {"papers": [candidate(batch[0])]}
+
+        original_run = mod.run_traecli_batch
+        mod.run_traecli_batch = fake_run
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                classified, status = mod.classify_with_traecli(
+                    papers,
+                    llm_cache_path=Path(tmp) / "traecli-classifications.json",
+                    profile="autonomous-driving",
+                    batch_size=60,
+                    timeout=30,
+                    trae_model="GPT-5.5",
+                    trae_thinking_effort="high",
+                    trae_verbosity="high",
+                    use_cache=False,
+                )
+        finally:
+            mod.run_traecli_batch = original_run
+
+        self.assertEqual(calls, [[papers[0]["id"], papers[1]["id"]], [papers[1]["id"]]])
+        self.assertEqual([paper["classifier"] for paper in classified], ["traecli", "traecli"])
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["single_paper_retries"], 1)
+
+    def test_traecli_retries_non_chinese_batch_results_individually(self):
+        mod = load_module()
+        paper = {
+            "id": "2606.00001v1",
+            "base_id": "2606.00001",
+            "title": "Autonomous Driving Perception",
+            "summary": "An autonomous driving perception method for road scenes.",
+            "categories": ["cs.CV"],
+            "source_categories": ["cs.CV"],
+        }
+        calls = []
+
+        def fake_run(batch, **_kwargs):
+            calls.append([item["id"] for item in batch])
+            if len(calls) == 1:
+                problem = "Autonomous driving needs reliable perception."
+                method = "The method uses camera features."
+            else:
+                problem = "自动驾驶需要可靠的道路场景感知。"
+                method = "方法使用相机特征完成道路场景感知。"
+            return {
+                "papers": [
+                    {
+                        "id": paper["id"],
+                        "relevance": "high",
+                        "driving_stack_category": "Perception",
+                        "technique_tags": ["camera"],
+                        "problem_statement": problem,
+                        "method_summary": method,
+                        "classification_reason": "核心贡献属于自动驾驶感知。",
+                        "uncertainty": "",
+                    }
+                ]
+            }
+
+        original_run = mod.run_traecli_batch
+        mod.run_traecli_batch = fake_run
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                classified, status = mod.classify_with_traecli(
+                    [paper],
+                    llm_cache_path=Path(tmp) / "traecli-classifications.json",
+                    profile="autonomous-driving",
+                    batch_size=60,
+                    timeout=30,
+                    trae_model="GPT-5.5",
+                    trae_thinking_effort="high",
+                    trae_verbosity="high",
+                    use_cache=False,
+                )
+        finally:
+            mod.run_traecli_batch = original_run
+
+        self.assertEqual(calls, [[paper["id"]], [paper["id"]]])
+        self.assertIn("自动驾驶", classified[0]["problem_statement"])
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["single_paper_retries"], 1)
+
+    def test_traecli_retries_incomplete_single_result_up_to_three_times(self):
+        mod = load_module()
+        paper = {
+            "id": "2606.00001v1",
+            "base_id": "2606.00001",
+            "title": "Autonomous Driving Perception",
+            "summary": "An autonomous driving perception method for road scenes.",
+            "categories": ["cs.CV"],
+            "source_categories": ["cs.CV"],
+        }
+        calls = []
+
+        def fake_run(batch, **_kwargs):
+            calls.append([item["id"] for item in batch])
+            chinese = len(calls) == 3
+            return {
+                "papers": [
+                    {
+                        "id": paper["id"],
+                        "relevance": "high",
+                        "driving_stack_category": "Perception",
+                        "technique_tags": ["camera"],
+                        "problem_statement": (
+                            "自动驾驶需要可靠的道路场景感知。"
+                            if chinese
+                            else "Autonomous driving needs reliable perception."
+                        ),
+                        "method_summary": (
+                            "方法使用相机特征完成道路场景感知。"
+                            if chinese
+                            else "The method uses camera features."
+                        ),
+                        "classification_reason": "核心贡献属于自动驾驶感知。",
+                        "uncertainty": "",
+                    }
+                ]
+            }
+
+        original_run = mod.run_traecli_batch
+        mod.run_traecli_batch = fake_run
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                classified, status = mod.classify_with_traecli(
+                    [paper],
+                    llm_cache_path=Path(tmp) / "traecli-classifications.json",
+                    profile="autonomous-driving",
+                    batch_size=60,
+                    timeout=30,
+                    trae_model="GPT-5.5",
+                    trae_thinking_effort="high",
+                    trae_verbosity="high",
+                    use_cache=False,
+                )
+        finally:
+            mod.run_traecli_batch = original_run
+
+        self.assertEqual(calls, [[paper["id"]], [paper["id"]], [paper["id"]]])
+        self.assertEqual(classified[0]["classifier"], "traecli")
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["single_paper_retries"], 2)
 
     def test_embodied_llm_prompt_requires_chinese_problem_and_method_fields(self):
         mod = load_module()

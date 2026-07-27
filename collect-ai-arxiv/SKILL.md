@@ -113,13 +113,15 @@ reports/
 - TraeCLI 分类缓存位于输出目录的 `.cache/traecli-classifications.json`，同样按 `profile + taxonomy_version + paper content` 隔离；重生成 Trae 分析缓存时加 `--no-llm-cache`。
 - LLM 分类输出中的 `解决问题`、`具体方法`、`分类理由` 等自然语言字段必须使用中文；英文摘要只能作为依据，不能直接复制到报告字段。
 - 脚本优先用 arXiv API；API 超时、`429` 或解析失败时使用 arXiv HTML recent 列表兜底，并在抓取状态里标注。
+- HTML recent 列表按公告日期分组；脚本补全摘要并取得 `citation_date` 后，会按真实提交日期二次过滤。剔除数量见 `submission-window-filter` 状态，明细见 JSON 的 `out_of_window_papers`。
 
 ## Report Review
 
 复核报告时按这个顺序：
 
 1. 先看 `抓取状态`，确认是否 API 成功或 fallback。
-2. 看 `classifier` 状态；如果是 `fallback_rules`，分类只是规则草稿，需要优先复核。
-3. `embodied` 检查 `Embodied Task 索引` 是否覆盖全部候选论文；无具体任务时应进入 `General/Cross-task`。
-4. `autonomous-driving` 检查每篇论文是否只进入一个 Driving Stack 小节。
-5. 检查每篇论文的 `解决问题`、`具体方法`、`分类理由` 是否能直接支撑阅读决策。
+2. 看 `submission-window-filter` 状态，确认最终论文提交日期都在报告窗口内；窗口外明细应只出现在 JSON 审计字段。
+3. 看 `classifier` 状态；如果是 `fallback_rules`，分类只是规则草稿，需要优先复核。
+4. `embodied` 检查 `Embodied Task 索引` 是否覆盖全部候选论文；无具体任务时应进入 `General/Cross-task`。
+5. `autonomous-driving` 检查每篇论文是否只进入一个 Driving Stack 小节。
+6. 检查每篇论文的 `解决问题`、`具体方法`、`分类理由` 是否能直接支撑阅读决策。
